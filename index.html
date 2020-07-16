@@ -1,0 +1,532 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="initial-scale=1,maximum-scale=1,user-scalable=no"
+    />
+    <title>
+      SceneLayerView - query statistics by geometry | Sample | ArcGIS API for
+      JavaScript 4.16
+    </title>
+    <style>
+      html,
+      body,
+      #viewDiv {
+        padding: 0;
+        margin: 0;
+        height: 100%;
+        width: 100%;
+      }
+
+      .esri-ui-top-right {
+        max-height: 100%;
+      }
+
+      #queryDiv,
+      #resultDiv {
+        min-width: 250px;
+        font-size: 14px;
+        padding: 10px;
+        display: none;
+        overflow-y: auto;
+        overflow-x: hidden;
+      }
+
+      .geometry-options {
+        display: flex;
+        flex-direction: row;
+      }
+      .geometry-button {
+        flex: 1;
+        border-style: solid;
+        border-width: 1px;
+        border-image: none;
+      }
+      .geometry-button-selected {
+        background: #4c4c4c;
+        color: #fff;
+      }
+
+      #bufferNum {
+        width: 90%;
+        margin: 2.5em auto 0;
+      }
+
+      .count {
+        white-space: nowrap;
+        font-size: 14px;
+        font-weight: bold;
+        display: inline-block;
+      }
+    </style>
+    <!-- Load the Chart.js library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/2.8.0/Chart.min.js"></script>
+
+    <link
+      rel="stylesheet"
+      href="https://js.arcgis.com/4.16/esri/themes/light/main.css"
+    />
+    <script src="https://js.arcgis.com/4.16/"></script>
+
+    <script>
+      require([
+        "esri/WebScene",
+        "esri/views/SceneView",
+        "esri/layers/GraphicsLayer",
+        "esri/widgets/Sketch/SketchViewModel",
+        "esri/widgets/Slider",
+        "esri/geometry/geometryEngine",
+        "esri/Graphic",
+        "esri/core/promiseUtils"
+      ], function (
+        WebScene,
+        SceneView,
+        GraphicsLayer,
+        SketchViewModel,
+        Slider,
+        geometryEngine,
+        Graphic,
+        promiseUtils
+      ) {
+        // Load webscene and display it in a SceneView
+        const webscene = new WebScene({
+          portalItem: {
+            id: "488706d4ce35438a8245f8f623a78b9c"
+          }
+        });
+        // create the SceneView
+        const view = new SceneView({
+          container: "viewDiv",
+          map: webscene
+        });
+        window.view = view;
+        // add a GraphicsLayer for the sketches and the buffer
+        const sketchLayer = new GraphicsLayer();
+        const bufferLayer = new GraphicsLayer();
+        view.map.addMany([bufferLayer, sketchLayer]);
+
+        let sceneLayer = null;
+        let sceneLayerView = null;
+        let bufferSize = 0;
+
+        // Assign scene layer once webscene is loaded and initialize UI
+        webscene.load().then(function () {
+          sceneLayer = webscene.layers.find(function (layer) {
+            return layer.title === "3DLayerJakarta";
+          });
+          sceneLayer.outFields = ["Material", "Year"];
+
+          view.whenLayerView(sceneLayer).then(function (layerView) {
+            sceneLayerView = layerView;
+            queryDiv.style.display = "block";
+          });
+        });
+
+        view.ui.add([queryDiv], "bottom-left");
+        view.ui.add([resultDiv], "top-right");
+
+        // use SketchViewModel to draw polygons that are used as a query
+        let sketchGeometry = null;
+        const sketchViewModel = new SketchViewModel({
+          layer: sketchLayer,
+          defaultUpdateOptions: {
+            tool: "reshape",
+            toggleToolOnClick: false
+          },
+          view: view,
+          defaultCreateOptions: { hasZ: false }
+        });
+
+        sketchViewModel.on("create", function (event) {
+          if (event.state === "complete") {
+            sketchGeometry = event.graphic.geometry;
+            runQuery();
+          }
+        });
+
+        sketchViewModel.on("update", function (event) {
+          if (event.state === "complete") {
+            sketchGeometry = event.graphics[0].geometry;
+            runQuery();
+          }
+        });
+        // draw geometry buttons - use the selected geometry to sktech
+        document
+          .getElementById("point-geometry-button")
+          .addEventListener("click", geometryButtonsClickHandler);
+        document
+          .getElementById("line-geometry-button")
+          .addEventListener("click", geometryButtonsClickHandler);
+        document
+          .getElementById("polygon-geometry-button")
+          .addEventListener("click", geometryButtonsClickHandler);
+        function geometryButtonsClickHandler(event) {
+          const geometryType = event.target.value;
+          clearGeometry();
+          sketchViewModel.create(geometryType);
+        }
+
+        const bufferNumSlider = new Slider({
+          container: "bufferNum",
+          min: 0,
+          max: 500,
+          steps: 1,
+          visibleElements: {
+            labels: true
+          },
+          precision: 0,
+          labelFormatFunction: function (value, type) {
+            return value.toString() + "m";
+          },
+          values: [0]
+        });
+        // get user entered values for buffer
+        bufferNumSlider.on(
+          ["thumb-change", "thumb-drag"],
+          bufferVariablesChanged
+        );
+        function bufferVariablesChanged(event) {
+          bufferSize = event.value;
+          runQuery();
+        }
+        // Clear the geometry and set the default renderer
+        document
+          .getElementById("clearGeometry")
+          .addEventListener("click", clearGeometry);
+
+        // Clear the geometry and set the default renderer
+        function clearGeometry() {
+          sketchGeometry = null;
+          sketchViewModel.cancel();
+          sketchLayer.removeAll();
+          bufferLayer.removeAll();
+          clearHighlighting();
+          clearCharts();
+          resultDiv.style.display = "none";
+        }
+
+        // set the geometry query on the visible SceneLayerView
+        var debouncedRunQuery = promiseUtils.debounce(function () {
+          if (!sketchGeometry) {
+            return;
+          }
+
+          resultDiv.style.display = "block";
+          updateBufferGraphic(bufferSize);
+          return promiseUtils.eachAlways([
+            queryStatistics(),
+            updateSceneLayer()
+          ]);
+        });
+
+        function runQuery() {
+          debouncedRunQuery().catch((error) => {
+            if (error.name === "AbortError") {
+              return;
+            }
+
+            console.error(error);
+          });
+        }
+
+        // Set the renderer with objectIds
+        var highlightHandle = null;
+        function clearHighlighting() {
+          if (highlightHandle) {
+            highlightHandle.remove();
+            highlightHandle = null;
+          }
+        }
+
+        function highlightBuildings(objectIds) {
+          // Remove any previous highlighting
+          clearHighlighting();
+          const objectIdField = sceneLayer.objectIdField;
+          document.getElementById("count").innerHTML = objectIds.length;
+
+          highlightHandle = sceneLayerView.highlight(objectIds);
+        }
+
+        // update the graphic with buffer
+        function updateBufferGraphic(buffer) {
+          // add a polygon graphic for the buffer
+          if (buffer > 0) {
+            var bufferGeometry = geometryEngine.geodesicBuffer(
+              sketchGeometry,
+              buffer,
+              "meters"
+            );
+            if (bufferLayer.graphics.length === 0) {
+              bufferLayer.add(
+                new Graphic({
+                  geometry: bufferGeometry,
+                  symbol: sketchViewModel.polygonSymbol
+                })
+              );
+            } else {
+              bufferLayer.graphics.getItemAt(0).geometry = bufferGeometry;
+            }
+          } else {
+            bufferLayer.removeAll();
+          }
+        }
+
+        function updateSceneLayer() {
+          const query = sceneLayerView.createQuery();
+          query.geometry = sketchGeometry;
+          query.distance = bufferSize;
+          return sceneLayerView.queryObjectIds(query).then(highlightBuildings);
+        }
+
+        var yearChart = null;
+        var materialChart = null;
+
+        function queryStatistics() {
+          const statDefinitions = [
+            {
+              onStatisticField:
+                "CASE WHEN Material = 'Beton' THEN 1 ELSE 0 END",
+              outStatisticFieldName: "material_beton",
+              statisticType: "sum"
+            },
+            {
+              onStatisticField:
+                "CASE WHEN Material = 'Bata' THEN 1 ELSE 0 END",
+              outStatisticFieldName: "material_bata",
+              statisticType: "sum"
+            },
+            {
+              onStatisticField:
+                "CASE WHEN Material = 'Kayu' THEN 1 ELSE 0 END",
+              outStatisticFieldName: "material_kayu",
+              statisticType: "sum"
+            },
+            {
+              onStatisticField:
+                "CASE WHEN Material = 'Besi' THEN 1 ELSE 0 END",
+              outStatisticFieldName: "material_besi",
+              statisticType: "sum"
+            },
+            {
+              onStatisticField:
+                "CASE WHEN Material IN ('Beton', 'Bata', 'Kayu', 'Besi') THEN 0 ELSE 1 END",
+              outStatisticFieldName: "material_lainnya",
+              statisticType: "sum"
+            },
+            {
+              onStatisticField:
+                "CASE WHEN (Year >= '1950' AND Year <= '1959') THEN 1 ELSE 0 END",
+              outStatisticFieldName: "year_1950",
+              statisticType: "sum"
+            },
+            {
+              onStatisticField:
+                "CASE WHEN (Year >= '1960' AND Year <= '1969') THEN 1 ELSE 0 END",
+              outStatisticFieldName: "year_1960",
+              statisticType: "sum"
+            },
+            {
+              onStatisticField:
+                "CASE WHEN (Year >= '1970' AND Year <= '1979') THEN 1 ELSE 0 END",
+              outStatisticFieldName: "year_1970",
+              statisticType: "sum"
+            },
+            {
+              onStatisticField:
+                "CASE WHEN (Year >= '1980' AND Year <= '1989') THEN 1 ELSE 0 END",
+              outStatisticFieldName: "year_1980",
+              statisticType: "sum"
+            },
+            {
+              onStatisticField:
+                "CASE WHEN (Year >= '1990' AND Year <= '1999') THEN 1 ELSE 0 END",
+              outStatisticFieldName: "year_1990",
+              statisticType: "sum"
+            },
+            {
+              onStatisticField:
+                "CASE WHEN (Year >= '2000' AND Year <= '2010') THEN 1 ELSE 0 END",
+              outStatisticFieldName: "year_2000",
+              statisticType: "sum"
+            }
+          ];
+          const query = sceneLayerView.createQuery();
+          query.geometry = sketchGeometry;
+          query.distance = bufferSize;
+          query.outStatistics = statDefinitions;
+
+          return sceneLayerView.queryFeatures(query).then(function (result) {
+            const allStats = result.features[0].attributes;
+            updateChart(materialChart, [
+              allStats.material_beton,
+              allStats.material_bata,
+              allStats.material_kayu,
+              allStats.material_besi,
+              allStats.material_lainnya
+            ]);
+            updateChart(yearChart, [
+              allStats.year_1950,
+              allStats.year_1960,
+              allStats.year_1970,
+              allStats.year_1980,
+              allStats.year_1990,
+              allStats.year_2000
+            ]);
+          }, console.error);
+        }
+
+        // Updates the given chart with new data
+        function updateChart(chart, dataValues) {
+          chart.data.datasets[0].data = dataValues;
+          chart.update();
+        }
+
+        function createYearChart() {
+          const yearCanvas = document.getElementById("year-chart");
+          yearChart = new Chart(yearCanvas.getContext("2d"), {
+            type: "horizontalBar",
+            data: {
+              labels: [
+                "1950-1959",
+                "1960-1969",
+                "1970-1979",
+                "1980-1989",
+                "1990-1999",
+                "2000-2010"
+              ],
+              datasets: [
+                {
+                  label: "Build year",
+                  backgroundColor: "#149dcf",
+                  stack: "Stack 0",
+                  data: [0, 0, 0, 0, 0, 0]
+                }
+              ]
+            },
+            options: {
+              responsive: false,
+              legend: {
+                display: false
+              },
+              title: {
+                display: true,
+                text: "Build year"
+              },
+              scales: {
+                xAxes: [
+                  {
+                    stacked: true,
+                    ticks: {
+                      beginAtZero: true,
+                      precision: 0
+                    }
+                  }
+                ],
+                yAxes: [
+                  {
+                    stacked: true
+                  }
+                ]
+              }
+            }
+          });
+        }
+        function createMaterialChart() {
+          const materialCanvas = document.getElementById("material-chart");
+          materialChart = new Chart(materialCanvas.getContext("2d"), {
+            type: "doughnut",
+            data: {
+              labels: ["Beton", "Bata", "Kayu", "Besi", "Lainnya"],
+              datasets: [
+                {
+                  backgroundColor: [
+                    "#FD7F6F",
+                    "#7EB0D5",
+                    "#B2E061",
+                    "#BD7EBE",
+                    "#FFB55A"
+                  ],
+                  borderWidth: 0,
+                  data: [0, 0, 0, 0, 0]
+                }
+              ]
+            },
+            options: {
+              responsive: false,
+              cutoutPercentage: 35,
+              legend: {
+                position: "bottom"
+              },
+              title: {
+                display: true,
+                text: "Building Material"
+              }
+            }
+          });
+        }
+
+        function clearCharts() {
+          updateChart(materialChart, [0, 0, 0, 0, 0]);
+          updateChart(yearChart, [0, 0, 0, 0, 0, 0]);
+          document.getElementById("count").innerHTML = 0;
+        }
+
+        createYearChart();
+        createMaterialChart();
+      });
+    </script>
+  </head>
+
+  <body>
+    <div id="viewDiv"></div>
+    <div id="queryDiv" class="esri-widget">
+      <b>Query by geometry</b><br />
+      <br />Draw a geometry to query by:
+      <div class="geometry-options">
+        <button
+          class="esri-widget--button esri-icon-map-pin geometry-button"
+          id="point-geometry-button"
+          value="point"
+          title="Query by point"
+        ></button>
+        <button
+          class="esri-widget--button esri-icon-polyline geometry-button"
+          id="line-geometry-button"
+          value="polyline"
+          title="Query by line"
+        ></button>
+        <button
+          class="esri-widget--button esri-icon-polygon geometry-button"
+          id="polygon-geometry-button"
+          value="polygon"
+          title="Query by polygon"
+        ></button>
+      </div>
+      <br />
+      <div class="tooltip">
+        <label for="bufferNum">Set a geometry buffer size:</label>
+        <div id="bufferNum"></div>
+      </div>
+      <br />
+      <button class="esri-button" id="clearGeometry" type="button">
+        Clear
+      </button>
+    </div>
+
+    <div id="resultDiv" class="esri-widget">
+      <div class="count">
+        Selected Buildings:
+        <div class="count" id="count">0</div>
+      </div>
+      <div class="charts">
+        <div>
+          <canvas id="year-chart" height="250" width="260" />
+        </div>
+        <div>
+          <canvas id="material-chart" width="250" height="300" />
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
